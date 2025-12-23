@@ -1,9 +1,9 @@
 import time
-import discord
-from discord import app_commands
-from discord.ext import commands
 import os
 import asyncio
+import discord
+from discord import app_commands
+from discord.ext import commands, tasks
 from openai import OpenAI
 
 # =========================
@@ -27,21 +27,39 @@ intents = discord.Intents.default()
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 # =========================
-# SLASH-SAFE COOLDOWN
+# SIMPLE COOLDOWN (SLASH SAFE)
 # =========================
-USER_COOLDOWNS = {}
 COOLDOWN_SECONDS = 10
+USER_COOLDOWNS: dict[int, float] = {}
+
+# =========================
+# ROTATING CUSTOM STATUSES
+# (NOT GAME ACTIVITY)
+# =========================
+STATUSES = [
+    "🩸 bleed-style AI",
+    "💬 /ask",
+    "⚡ chatcelp",
+]
+
+@tasks.loop(seconds=15)
+async def rotate_status():
+    try:
+        status = STATUSES[int(time.time()) % len(STATUSES)]
+        await bot.change_presence(
+            activity=discord.CustomActivity(name=status)
+        )
+    except Exception as e:
+        print("Status error:", e)
 
 # =========================
 # READY
 # =========================
 @bot.event
 async def on_ready():
-    try:
-        await bot.tree.sync()
-        print(f"Logged in as {bot.user}")
-    except Exception as e:
-        print("Command sync failed:", e)
+    await bot.tree.sync()
+    rotate_status.start()
+    print(f"Logged in as {bot.user}")
 
 # =========================
 # OPENAI CALL (THREAD SAFE)
@@ -58,11 +76,14 @@ def ask_openai(question: str) -> str:
     return response.choices[0].message.content
 
 # =========================
-# SLASH COMMAND
+# SLASH COMMAND (FIXED)
 # =========================
 @bot.tree.command(name="ask", description="Ask ChatGPT a question")
 @app_commands.describe(question="What do you want to ask?")
 async def ask(interaction: discord.Interaction, question: str):
+
+    # ✅ ALWAYS ACK FIRST
+    await interaction.response.defer(thinking=True)
 
     try:
         user_id = interaction.user.id
@@ -71,7 +92,7 @@ async def ask(interaction: discord.Interaction, question: str):
         last_used = USER_COOLDOWNS.get(user_id, 0)
         if now - last_used < COOLDOWN_SECONDS:
             remaining = int(COOLDOWN_SECONDS - (now - last_used))
-            await interaction.response.send_message(
+            await interaction.followup.send(
                 f"⏳ Slow down! Try again in **{remaining}s**.",
                 ephemeral=True
             )
@@ -79,14 +100,11 @@ async def ask(interaction: discord.Interaction, question: str):
 
         USER_COOLDOWNS[user_id] = now
 
-        # Prevent "application did not respond"
-        await interaction.response.defer(thinking=True)
-
-        # Run OpenAI call safely
+        # Run OpenAI safely off the event loop
         answer = await asyncio.to_thread(ask_openai, question)
 
         if not answer:
-            raise RuntimeError("Empty response from OpenAI")
+            raise RuntimeError("Empty OpenAI response")
 
         if len(answer) > 1900:
             answer = answer[:1900] + "..."
@@ -95,18 +113,10 @@ async def ask(interaction: discord.Interaction, question: str):
 
     except Exception as e:
         print("Ask command error:", e)
-
-        # If defer already happened, use followup
-        if interaction.response.is_done():
-            await interaction.followup.send(
-                "❌ Error talking to OpenAI. Please try again later.",
-                ephemeral=True
-            )
-        else:
-            await interaction.response.send_message(
-                "❌ Error talking to OpenAI. Please try again later.",
-                ephemeral=True
-            )
+        await interaction.followup.send(
+            "❌ Error talking to OpenAI. Please try again later.",
+            ephemeral=True
+        )
 
 # =========================
 # GLOBAL ERROR SAFETY
@@ -119,4 +129,3 @@ async def on_error(event, *args, **kwargs):
 # START BOT
 # =========================
 bot.run(DISCORD_TOKEN)
-
